@@ -1,0 +1,263 @@
+# -*- mode: python -*-
+
+import glob
+from importlib import import_module
+import os
+import platform
+import sys
+
+from PyInstaller.building.api import (
+    COLLECT,
+    EXE,
+    PYZ,
+)
+from PyInstaller.building.build_main import Analysis
+from PyInstaller.building.osx import BUNDLE
+
+
+sys.path.insert(0, '.')
+from picard import (
+    PICARD_APP_ID,
+    PICARD_APP_NAME,
+    PICARD_DISPLAY_NAME,
+    PICARD_ORG_NAME,
+    PICARD_VERSION,
+    __version__,
+)
+from picard.env import parse_bool_env
+
+
+def _picard_get_locale_files():
+    locales = []
+    path_domain = {
+        'po': 'picard',
+        os.path.join('po', 'attributes'): 'picard-attributes',
+        os.path.join('po', 'constants'): 'picard-constants',
+        os.path.join('po', 'countries'): 'picard-countries',
+    }
+    for path, domain in path_domain.items():
+        for filepath in glob.glob(os.path.join(path, '*.po')):
+            filename = os.path.basename(filepath)
+            locale = os.path.splitext(filename)[0]
+            locales.append((domain, locale, filepath))
+    return locales
+
+
+def get_locale_messages():
+    data_files = []
+    for locale in _picard_get_locale_files():
+        data_files.append(
+            (
+                os.path.join("picard", "locale", locale[1], "LC_MESSAGES", locale[0] + ".mo"),
+                os.path.join("locale", locale[1], "LC_MESSAGES"),
+            )
+        )
+    return data_files
+
+
+def has_module(module_name):
+    """Check whether the given module is available."""
+    try:
+        import_module(module_name)
+        return True
+    except ImportError:
+        return False
+
+
+os_name = platform.system()
+build_portable = parse_bool_env('PICARD_BUILD_PORTABLE')
+binaries = []
+
+data_files = get_locale_messages()
+
+fpcalc_name = 'fpcalc'
+if os_name == 'Windows':
+    fpcalc_name = 'fpcalc.exe'
+    binaries += [('discid.dll', '.')]
+    if os.path.exists('TaskbarLib.tlb'):
+        binaries += [('TaskbarLib.tlb', '.')]
+
+elif os_name == 'Darwin':
+    binaries += [('libdiscid.0.dylib', '.')]
+
+if os.path.isfile(fpcalc_name):
+    binaries += [(fpcalc_name, '.')]
+
+runtime_hooks = []
+if os_name == 'Windows':
+    runtime_hooks.append('scripts/pyinstaller/win-startup-hook.py')
+elif os_name == 'Darwin':
+    runtime_hooks.append('scripts/pyinstaller/macos-library-path-hook.py')
+if build_portable:
+    runtime_hooks.append('scripts/pyinstaller/portable-hook.py')
+
+hiddenimports = [
+    'cffi',  # Needed for pygit2
+    # Used by plugins (e.g. "Create Local Plugin"), but not otherwise
+    # referenced, so PyInstaller would not bundle it (PICARD-3432).
+    'picard.plugin3.cli',
+    # SQLite is part of the Python standard library but Picard does not import
+    # it, so PyInstaller would not bundle the sqlite3 module and its native
+    # extension. Include it so plugins (and potentially Picard itself) can use
+    # SQLite in packaged builds.
+    'sqlite3',
+]
+
+if has_module('opencc'):
+    hiddenimports.append('opencc')  # opencc module
+
+if has_module('zstandard'):
+    hiddenimports.append('zstandard')  # xqaf plugin
+
+excludes = []
+
+# If tomllib is available, tomli can be excluded
+if has_module('tomllib'):
+    excludes.append('tomli')
+
+a = Analysis(
+    ['tagger.py'],
+    pathex=['picard'],
+    binaries=binaries,
+    datas=data_files,
+    hiddenimports=hiddenimports,
+    hookspath=None,
+    runtime_hooks=runtime_hooks,
+    excludes=excludes,
+)
+
+pyz = PYZ(a.pure, a.zipped_data)
+
+if build_portable:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name='{}-{}-{}'.format(PICARD_ORG_NAME, PICARD_APP_NAME, __version__),
+        debug=False,
+        strip=False,
+        upx=False,
+        icon='picard.ico',
+        version='win-version-info.txt',
+        console=False,
+    )
+
+else:
+    # The main executable
+    exe = EXE(
+        pyz,
+        a.scripts,
+        exclude_binaries=True,
+        # Avoid name clash between picard executable and picard module folder
+        name='picard' if os_name == 'Windows' else 'picard-run',
+        debug=False,
+        strip=False,
+        upx=False,
+        icon='picard.ico',
+        console=False,
+        # Windows specific
+        version='win-version-info.txt',
+        # macOS specific
+        target_arch=os.environ.get('TARGET_ARCH', None),
+        codesign_identity=os.environ.get('CODESIGN_IDENTITY', None),
+        entitlements_file='./scripts/package/entitlements.plist',
+    )
+
+    collect_items = [exe, a.binaries, a.zipfiles, a.datas]
+
+    # The picard-cli tool.
+    # Do not include on macOS, since macOS does not support multiple targets
+    # in the app bundle and mixing windowed and console executables.
+    if os_name != 'Darwin':
+        a_cli = Analysis(
+            ['picard/cli/__main__.py'],
+            pathex=['picard'],
+            binaries=[],
+            datas=[],
+            hiddenimports=['cffi', 'sqlite3'],
+            hookspath=None,
+            runtime_hooks=[],
+            excludes=excludes,
+        )
+        pyz_cli = PYZ(a_cli.pure, a_cli.zipped_data)
+        exe_cli = EXE(
+            pyz_cli,
+            a_cli.scripts,
+            exclude_binaries=True,
+            name='picard-cli',
+            debug=False,
+            strip=False,
+            upx=False,
+            icon='picard.ico',
+            console=True,
+            # Windows specific
+            version='win-version-info.txt',
+        )
+        collect_items.extend([exe_cli, a_cli.binaries, a_cli.zipfiles, a_cli.datas])
+
+    coll = COLLECT(*collect_items, strip=False, upx=False, name='picard')
+
+    if os_name == 'Darwin':
+        info_plist = {
+            'CFBundleName': PICARD_APP_NAME,
+            'CFBundleDisplayName': PICARD_DISPLAY_NAME,
+            'CFBundleIdentifier': PICARD_APP_ID,
+            'CFBundleVersion': '%d.%d.%d' % PICARD_VERSION[:3],
+            'CFBundleShortVersionString': PICARD_VERSION.short_str(),
+            'LSApplicationCategoryType': 'public.app-category.music',
+            'LSMinimumSystemVersion': os.environ.get('MACOSX_DEPLOYMENT_TARGET', '11.0'),
+            'NSHighResolutionCapable': True,
+            'NSPrincipalClass': 'NSApplication',
+            'NSRequiresAquaSystemAppearance': False,
+            # Opt-out of the macOS 26 "Liquid Glass" design, as it causes
+            # rendering issues with checkboxes in a QTreeWidget.
+            'UIDesignRequiresCompatibility': True,
+            'CFBundleDocumentTypes': [
+                {
+                    # Add UTIs understood by macOS
+                    'LSItemContentTypes': [
+                        'com.apple.m4a-audio',
+                        'com.apple.m4v-video',
+                        'com.apple.protected-mpeg-4-audio',
+                        'com.microsoft.advanced-systems-format',
+                        'com.microsoft.waveform-audio',
+                        'com.microsoft.windows-media-wm',
+                        'com.microsoft.windows-media-wma',
+                        'com.microsoft.windows-media-wmv',
+                        'org.xiph.flac',
+                        'public.aac-audio',
+                        'public.ac3-audio',
+                        'public.aifc-audio',
+                        'public.aiff-audio',
+                        'public.enhanced-ac3-audio',
+                        'public.folder',
+                        'public.midi-audio',
+                        'public.mp3',
+                        'public.mpeg-4',
+                        'public.mpeg-4-audio',
+                    ],
+                    'CFBundleTypeRole': 'Editor',
+                }
+            ],
+        }
+
+        # Add additional supported file types by extension
+        from picard.formats import DEFAULT_FORMATS
+
+        for format in DEFAULT_FORMATS:
+            info_plist['CFBundleDocumentTypes'].append(
+                {
+                    'CFBundleTypeExtensions': [ext[1:] for ext in format.EXTENSIONS],
+                    'CFBundleTypeRole': 'Editor',
+                }
+            )
+
+        app = BUNDLE(
+            coll,
+            name='{} {}.app'.format(PICARD_ORG_NAME, PICARD_APP_NAME),
+            icon='picard.icns',
+            bundle_identifier=PICARD_APP_ID,
+            info_plist=info_plist,
+        )
